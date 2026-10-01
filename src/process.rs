@@ -97,6 +97,15 @@ pub struct Process {
 }
 
 impl Process {
+    /// A short name for messages: the executable's file name, or the
+    /// kernel's short name when argv is unreadable.
+    pub fn name(&self) -> &str {
+        match self.args.as_ref().and_then(|a| a.first()) {
+            Some(argv0) => argv0.rsplit('/').next().unwrap_or(argv0),
+            None => &self.comm,
+        }
+    }
+
     /// The text a COMMAND column shows: argv joined by spaces, or the
     /// kernel's short name in parentheses when argv is unreadable.
     pub fn command_line(&self) -> String {
@@ -132,6 +141,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(f.suffix(), "+Ns");
+    }
+
+    #[test]
+    fn name_is_argv0_basename_or_comm() {
+        let mut p = Process {
+            comm: "2.1.286".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.name(), "2.1.286");
+        p.args = Some(vec!["/usr/local/bin/claude".into(), "--resume".into()]);
+        assert_eq!(p.name(), "claude");
     }
 
     #[test]

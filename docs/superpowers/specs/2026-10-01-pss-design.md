@@ -15,10 +15,12 @@ a personal tool first; flag compatibility with macOS/BSD `ps` (especially
 - Flags: BSD/macOS-compatible subset, plus our own extras.
 - Highlighting: resource heat, process state, users, command-line parts.
 - Pager: `less`-style snapshot viewer (scroll, page, `/` search, pinned header, `q`).
+- Interactive selection (added after v1): a selection bar, `K` to kill the
+  selected process, `r` to refresh, `-i` to open the view for short output.
 - Extras: `--sort`, pattern search (`pss node`), `--no-pager`, human-readable sizes.
 
-**Deferred (v2+)**: in-pager sort keys and refresh, live/htop mode (auto-refresh,
-select, kill), `--tree`, Linux backend, self/parent marking, zebra striping.
+**Deferred**: in-pager sort keys, auto-refresh (live/htop mode), `--tree`,
+Linux backend, self/parent marking, zebra striping.
 
 ## Architecture
 
@@ -112,12 +114,21 @@ split on commas/spaces; `kw=HEADER` renames. Unknown keywords error like `ps`
 
 - stdout is not a tty → plain text (color only with `--color=always`), no truncation, no pager.
 - stdout is a tty → color, truncate lines to terminal width (unless `-ww`), and
-  open the pager if the output is taller than the terminal and paging isn't disabled.
+  open the pager if the output is taller than the terminal (or `-i` is given)
+  and paging isn't disabled.
 
-Pager keys: `j/k/↓/↑` line, `space/f/PgDn` and `b/PgUp` page, `g/G/Home/End`,
-`←/→` horizontal scroll (lines are chopped, like `less -S`), `/` search,
-`n/N` next/previous match, `q/Esc/Ctrl-C` quit. Header row stays pinned; a
-status line shows position and search state.
+Pager keys: `j/k/↓/↑` move the selection (the view follows it),
+`space/f/PgDn` and `b/PgUp` page, `g/G/Home/End`, `←/→` horizontal scroll
+(lines are chopped, like `less -S`), `/` search (selects the match), `n/N`
+next/previous match, `q/Esc/Ctrl-C` quit. Header row stays pinned; a status
+line shows position, search state and messages.
+
+Killing: `K` asks `Kill PID (name)?` in the status line; `y` sends TERM, `9`
+sends KILL, any other key cancels. After a signal the list is collected again
+with the same options; the selection stays on the same process, or the same
+position if it is gone. Errors (another user's process, already exited) show
+in the status line. `pss` refuses to signal itself, since dying would leave
+the terminal in the alternate screen. `r` collects the list again on demand.
 
 ## Errors
 

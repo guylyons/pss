@@ -88,6 +88,7 @@ mod tests {
                 Span::new("1 ", Role::Plain),
                 Span::new("90.0", Role::Pcpu(90.0)),
             ]],
+            ids: vec![],
         }
     }
 

@@ -1,19 +1,29 @@
-//! A `less`-style viewer: pinned header, scrolling, horizontal panning and
-//! `/` search. [`State`] holds all the logic; [`run`] only draws it.
+//! The interactive view: a `less`-style pager with a selection bar.
+//! Pinned header, scrolling, panning, `/` search, and `K` to kill the
+//! selected process. [`State`] holds all the logic; [`run`] only draws it.
 
 use std::io;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color as TColor, Modifier, Style as TStyle};
 use ratatui::text::{Line as TLine, Span as TSpan};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use unicode_width::UnicodeWidthStr;
 
+use crate::signal::Signal;
 use crate::style::{Color, Role, theme};
-use crate::table::Table;
+use crate::table::{RowId, Table};
 use crate::text::{Line, Matcher, highlight, plain_text};
+
+/// What the view needs from the rest of the program.
+pub trait Host {
+    /// Collect the process list again, with the same options as before.
+    fn reload(&mut self) -> io::Result<Table>;
+    /// Send a signal; the error is a message for the status line.
+    fn kill(&mut self, pid: i32, sig: Signal) -> Result<(), String>;
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Flow {
@@ -22,7 +32,10 @@ pub enum Flow {
 }
 
 pub struct State {
+    pub table: Table,
     texts: Vec<String>,
+    /// Selected row.
+    pub cursor: usize,
     /// First visible row and leftmost visible column.
     pub top: usize,
     pub left: usize,
@@ -33,13 +46,17 @@ pub struct State {
     query: String,
     /// Some while typing a `/` query.
     pub prompt: Option<String>,
+    /// Some while asking whether to kill this process.
+    confirm: Option<RowId>,
     pub message: Option<String>,
 }
 
 impl State {
-    pub fn new(table: &Table) -> State {
+    pub fn new(table: Table) -> State {
         State {
             texts: table.rows.iter().map(|l| plain_text(l)).collect(),
+            table,
+            cursor: 0,
             top: 0,
             left: 0,
             height: 1,
@@ -47,27 +64,76 @@ impl State {
             search: None,
             query: String::new(),
             prompt: None,
+            confirm: None,
             message: None,
         }
+    }
+
+    pub fn selected(&self) -> Option<&RowId> {
+        self.table.ids.get(self.cursor)
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
         self.width = width.max(1);
         self.height = height.max(1);
-        self.top = self.top.min(self.max_top());
+        self.follow();
+    }
+
+    fn last(&self) -> usize {
+        self.texts.len().saturating_sub(1)
     }
 
     fn max_top(&self) -> usize {
         self.texts.len().saturating_sub(self.height)
     }
 
-    fn scroll(&mut self, delta: isize) {
-        self.top = self.top.saturating_add_signed(delta).min(self.max_top());
+    /// Scroll just enough to keep the selection on screen.
+    fn follow(&mut self) {
+        if self.cursor < self.top {
+            self.top = self.cursor;
+        } else if self.cursor >= self.top + self.height {
+            self.top = self.cursor + 1 - self.height;
+        }
+        self.top = self.top.min(self.max_top());
     }
 
-    pub fn key(&mut self, k: KeyEvent) -> Flow {
+    fn move_cursor(&mut self, delta: isize) {
+        self.cursor = self.cursor.saturating_add_signed(delta).min(self.last());
+        self.follow();
+    }
+
+    /// Page: move the view and the selection together, like less.
+    fn page(&mut self, delta: isize) {
+        self.top = self.top.saturating_add_signed(delta).min(self.max_top());
+        self.move_cursor(delta);
+    }
+
+    /// Swap in a fresh table, keeping the same process selected if it is
+    /// still there, otherwise the same position.
+    fn set_table(&mut self, table: Table) {
+        let pid = self.selected().map(|r| r.pid);
+        self.texts = table.rows.iter().map(|l| plain_text(l)).collect();
+        self.table = table;
+        self.cursor = pid
+            .and_then(|pid| self.table.ids.iter().position(|r| r.pid == pid))
+            .unwrap_or(self.cursor)
+            .min(self.last());
+        self.follow();
+    }
+
+    fn reload(&mut self, host: &mut dyn Host) -> Result<(), String> {
+        let table = host.reload().map_err(|e| format!("Refresh failed: {e}"))?;
+        self.set_table(table);
+        Ok(())
+    }
+
+    pub fn key(&mut self, k: KeyEvent, host: &mut dyn Host) -> Flow {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             return Flow::Quit;
+        }
+        if let Some(target) = self.confirm.take() {
+            self.confirm_kill(target, k.code, host);
+            return Flow::Continue;
         }
         if let Some(input) = self.prompt.as_mut() {
             match k.code {
@@ -96,26 +162,53 @@ impl State {
         let pan = (self.width / 2).max(1);
         match k.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Flow::Quit,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => self.scroll(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll(-1),
-            KeyCode::Char(' ') | KeyCode::Char('f') | KeyCode::PageDown => self.scroll(page),
-            KeyCode::Char('b') | KeyCode::PageUp => self.scroll(-page),
-            KeyCode::Char('d') => self.scroll(page / 2),
-            KeyCode::Char('u') => self.scroll(-page / 2),
-            KeyCode::Char('g') | KeyCode::Home => self.top = 0,
-            KeyCode::Char('G') | KeyCode::End => self.top = self.max_top(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => self.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Char(' ') | KeyCode::Char('f') | KeyCode::PageDown => self.page(page),
+            KeyCode::Char('b') | KeyCode::PageUp => self.page(-page),
+            KeyCode::Char('d') => self.page(page / 2),
+            KeyCode::Char('u') => self.page(-page / 2),
+            KeyCode::Char('g') | KeyCode::Home => self.move_cursor(isize::MIN),
+            KeyCode::Char('G') | KeyCode::End => self.move_cursor(isize::MAX),
             KeyCode::Right | KeyCode::Char('l') => self.left += pan,
             KeyCode::Left | KeyCode::Char('h') => self.left = self.left.saturating_sub(pan),
             KeyCode::Char('/') => self.prompt = Some(String::new()),
             KeyCode::Char('n') => self.jump(true, false),
             KeyCode::Char('N') => self.jump(false, false),
+            KeyCode::Char('K') => match self.selected() {
+                Some(row) => self.confirm = Some(row.clone()),
+                None => self.message = Some("Nothing selected".into()),
+            },
+            KeyCode::Char('r') => self.message = self.reload(host).err(),
             _ => {}
         }
         Flow::Continue
     }
 
-    /// Move to the next (or previous) row matching the search. `inclusive`
-    /// lets a fresh search land on the current top row.
+    fn confirm_kill(&mut self, target: RowId, answer: KeyCode, host: &mut dyn Host) {
+        let sig = match answer {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Signal::Term,
+            KeyCode::Char('9') => Signal::Kill,
+            _ => {
+                self.message = Some("Kill cancelled".into());
+                return;
+            }
+        };
+        let RowId { pid, name } = &target;
+        self.message = Some(match host.kill(*pid, sig) {
+            Err(e) => e,
+            Ok(()) => {
+                let sent = format!("Sent {} to {pid} ({name})", sig.name());
+                match self.reload(host) {
+                    Ok(()) => sent,
+                    Err(e) => format!("{sent}; {e}"),
+                }
+            }
+        });
+    }
+
+    /// Select the next (or previous) row matching the search. `inclusive`
+    /// lets a fresh search land on the selected row itself.
     fn jump(&mut self, forward: bool, inclusive: bool) {
         let Some(m) = &self.search else {
             self.message = Some("No previous search".into());
@@ -123,14 +216,17 @@ impl State {
         };
         let hit = |i: &usize| m.is_match(&self.texts[*i]);
         let found = if forward {
-            let start = if inclusive { self.top } else { self.top + 1 };
+            let start = if inclusive {
+                self.cursor
+            } else {
+                self.cursor + 1
+            };
             (start..self.texts.len()).find(hit)
         } else {
-            (0..self.top).rev().find(hit)
+            (0..self.cursor).rev().find(hit)
         };
         match found {
             Some(row) => {
-                self.top = row.min(self.max_top());
                 // Pan so the match is on screen.
                 let at = m
                     .find(&self.texts[row])
@@ -139,12 +235,17 @@ impl State {
                 if at < self.left || at >= self.left + self.width {
                     self.left = at.saturating_sub(self.width / 3);
                 }
+                self.cursor = row;
+                self.follow();
             }
             None => self.message = Some(format!("Pattern not found: {}", self.query)),
         }
     }
 
     pub fn status(&self) -> String {
+        if let Some(RowId { pid, name }) = &self.confirm {
+            return format!("Kill {pid} ({name})?  y = TERM   9 = KILL   any other key cancels");
+        }
         if let Some(p) = &self.prompt {
             return format!("/{p}");
         }
@@ -159,29 +260,31 @@ impl State {
             format!("{}%", bottom * 100 / n.max(1))
         };
         format!(
-            " rows {}-{bottom} of {n}  {pos}   q quit  / search  ←/→ pan",
+            " rows {}-{bottom} of {n}  {pos}   ↑/↓ select  K kill  r refresh  / search  ←/→ pan  q quit",
             self.top + 1
         )
     }
-
-    fn search(&self) -> Option<&Matcher> {
-        self.search.as_ref()
-    }
 }
 
-pub fn run(table: &Table, color: bool) -> io::Result<()> {
+pub fn run(table: Table, color: bool, host: &mut dyn Host) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, table, color);
+    let result = event_loop(&mut terminal, State::new(table), color, host);
     ratatui::restore();
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, table: &Table, color: bool) -> io::Result<()> {
-    let mut state = State::new(table);
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    mut state: State,
+    color: bool,
+    host: &mut dyn Host,
+) -> io::Result<()> {
     loop {
-        terminal.draw(|f| draw(f, table, &mut state, color))?;
+        terminal.draw(|f| draw(f, &mut state, color))?;
         match event::read()? {
-            Event::Key(k) if k.kind != KeyEventKind::Release && state.key(k) == Flow::Quit => {
+            Event::Key(k)
+                if k.kind != KeyEventKind::Release && state.key(k, host) == Flow::Quit =>
+            {
                 return Ok(());
             }
             _ => {} // resize and others just redraw
@@ -189,7 +292,7 @@ fn event_loop(terminal: &mut DefaultTerminal, table: &Table, color: bool) -> io:
     }
 }
 
-fn draw(f: &mut Frame, table: &Table, state: &mut State, color: bool) {
+fn draw(f: &mut Frame, state: &mut State, color: bool) {
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -200,16 +303,17 @@ fn draw(f: &mut Frame, table: &Table, state: &mut State, color: bool) {
     let left = state.left.min(u16::MAX as usize) as u16;
 
     f.render_widget(
-        Paragraph::new(to_tui(&table.header, color)).scroll((0, left)),
+        Paragraph::new(to_tui(&state.table.header, color)).scroll((0, left)),
         head,
     );
 
-    let rows: Vec<TLine> = table
+    let rows: Vec<TLine> = state
+        .table
         .rows
         .iter()
         .skip(state.top)
         .take(state.height)
-        .map(|line| match state.search() {
+        .map(|line| match &state.search {
             Some(m) => to_tui(
                 &highlight(line.clone(), &m.find(&plain_text(line)), Role::SearchHit),
                 color,
@@ -218,6 +322,15 @@ fn draw(f: &mut Frame, table: &Table, state: &mut State, color: bool) {
         })
         .collect();
     f.render_widget(Paragraph::new(rows).scroll((0, left)), body);
+
+    // The selection bar spans the full width, past the end of the text.
+    if !state.table.rows.is_empty() {
+        let y = body.y + (state.cursor - state.top) as u16;
+        f.buffer_mut().set_style(
+            Rect::new(body.x, y, body.width, 1),
+            TStyle::default().add_modifier(Modifier::REVERSED),
+        );
+    }
 
     let status_style = TStyle::default().add_modifier(Modifier::REVERSED);
     f.render_widget(Paragraph::new(state.status()).style(status_style), foot);
@@ -276,75 +389,220 @@ fn tui_color(c: Color) -> TColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::RowId;
     use crate::text::Span;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    fn table(n: usize) -> Table {
+    fn table_of(pids: &[i32]) -> Table {
         Table {
             header: vec![Span::new("PID CMD", Role::Header)],
-            rows: (0..n)
-                .map(|i| {
-                    vec![Span::new(
-                        format!("{i} {}", if i == 42 { "needle" } else { "hay" }),
-                        Role::Plain,
-                    )]
+            rows: pids
+                .iter()
+                .map(|p| {
+                    let cmd = if *p == 1042 { "needle" } else { "hay" };
+                    vec![Span::new(format!("{p} {cmd}"), Role::Plain)]
+                })
+                .collect(),
+            ids: pids
+                .iter()
+                .map(|p| RowId {
+                    pid: *p,
+                    name: format!("p{}", p - 1000),
                 })
                 .collect(),
         }
     }
 
-    fn press(s: &mut State, code: KeyCode) -> Flow {
-        s.key(KeyEvent::new(code, KeyModifiers::NONE))
+    fn pids(n: i32) -> Vec<i32> {
+        (1000..1000 + n).collect()
     }
 
-    fn typed(s: &mut State, text: &str) {
-        for c in text.chars() {
-            press(s, KeyCode::Char(c));
+    /// Records signals instead of sending them; killed pids vanish on reload.
+    #[derive(Default)]
+    struct FakeHost {
+        pids: Vec<i32>,
+        kills: Vec<(i32, Signal)>,
+        refuse: bool,
+    }
+
+    impl Host for FakeHost {
+        fn reload(&mut self) -> io::Result<Table> {
+            Ok(table_of(&self.pids))
+        }
+        fn kill(&mut self, pid: i32, sig: Signal) -> Result<(), String> {
+            if self.refuse {
+                return Err(format!("{pid}: not permitted"));
+            }
+            self.kills.push((pid, sig));
+            self.pids.retain(|p| *p != pid);
+            Ok(())
         }
     }
 
-    #[test]
-    fn scrolling_clamps_to_last_page() {
-        let mut s = State::new(&table(100));
+    fn setup(n: i32) -> (State, FakeHost) {
+        let mut s = State::new(table_of(&pids(n)));
         s.resize(80, 10);
-        press(&mut s, KeyCode::Char('G'));
-        assert_eq!(s.top, 90);
-        press(&mut s, KeyCode::Char(' '));
-        assert_eq!(s.top, 90);
-        press(&mut s, KeyCode::Char('b'));
-        assert_eq!(s.top, 80);
-        press(&mut s, KeyCode::Char('g'));
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.top, 0);
+        (
+            s,
+            FakeHost {
+                pids: pids(n),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn press(s: &mut State, h: &mut FakeHost, code: KeyCode) -> Flow {
+        s.key(KeyEvent::new(code, KeyModifiers::NONE), h)
+    }
+
+    fn typed(s: &mut State, h: &mut FakeHost, text: &str) {
+        for c in text.chars() {
+            press(s, h, KeyCode::Char(c));
+        }
+    }
+
+    fn selected_pid(s: &State) -> Option<i32> {
+        s.selected().map(|r| r.pid)
     }
 
     #[test]
-    fn search_jumps_and_reports_misses() {
-        let mut s = State::new(&table(100));
-        s.resize(80, 10);
-        typed(&mut s, "/needle");
+    fn cursor_moves_and_view_follows() {
+        let (mut s, mut h) = setup(100);
+        for _ in 0..12 {
+            press(&mut s, &mut h, KeyCode::Down);
+        }
+        assert_eq!((s.cursor, s.top), (12, 3));
+        press(&mut s, &mut h, KeyCode::Char('G'));
+        assert_eq!((s.cursor, s.top), (99, 90));
+        press(&mut s, &mut h, KeyCode::Char('k'));
+        assert_eq!((s.cursor, s.top), (98, 90));
+        press(&mut s, &mut h, KeyCode::Char('g'));
+        assert_eq!((s.cursor, s.top), (0, 0));
+        press(&mut s, &mut h, KeyCode::Up);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn paging_moves_view_and_cursor_together() {
+        let (mut s, mut h) = setup(100);
+        press(&mut s, &mut h, KeyCode::Char('j'));
+        press(&mut s, &mut h, KeyCode::Char(' '));
+        assert_eq!((s.cursor, s.top), (11, 10));
+        press(&mut s, &mut h, KeyCode::Char('b'));
+        assert_eq!((s.cursor, s.top), (1, 0));
+    }
+
+    #[test]
+    fn search_selects_the_match() {
+        let (mut s, mut h) = setup(100);
+        typed(&mut s, &mut h, "/needle");
         assert_eq!(s.status(), "/needle");
-        press(&mut s, KeyCode::Enter);
-        assert_eq!(s.top, 42);
-        press(&mut s, KeyCode::Char('n'));
+        press(&mut s, &mut h, KeyCode::Enter);
+        assert_eq!(selected_pid(&s), Some(1042));
+        assert!(s.top <= 42 && 42 < s.top + s.height);
+        press(&mut s, &mut h, KeyCode::Char('n'));
         assert_eq!(s.message.as_deref(), Some("Pattern not found: needle"));
-        press(&mut s, KeyCode::Char('g'));
-        press(&mut s, KeyCode::Char('n'));
-        assert_eq!(s.top, 42);
+        press(&mut s, &mut h, KeyCode::Char('g'));
+        press(&mut s, &mut h, KeyCode::Char('n'));
+        assert_eq!(selected_pid(&s), Some(1042));
+    }
+
+    #[test]
+    fn kill_asks_first_then_sends_term_and_refreshes() {
+        let (mut s, mut h) = setup(10);
+        typed(&mut s, &mut h, "jjj");
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        assert!(s.status().starts_with("Kill 1003 (p3)?"), "{}", s.status());
+        assert!(h.kills.is_empty(), "nothing sent before confirming");
+
+        press(&mut s, &mut h, KeyCode::Char('y'));
+        assert_eq!(h.kills, vec![(1003, Signal::Term)]);
+        assert_eq!(s.status(), "Sent TERM to 1003 (p3)");
+        assert!(!s.table.ids.iter().any(|r| r.pid == 1003), "list refreshed");
+        assert_eq!(selected_pid(&s), Some(1004), "selection stays in place");
+    }
+
+    #[test]
+    fn nine_sends_kill() {
+        let (mut s, mut h) = setup(10);
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        press(&mut s, &mut h, KeyCode::Char('9'));
+        assert_eq!(h.kills, vec![(1000, Signal::Kill)]);
+    }
+
+    #[test]
+    fn any_other_key_cancels_kill() {
+        let (mut s, mut h) = setup(10);
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        assert_eq!(press(&mut s, &mut h, KeyCode::Char('q')), Flow::Continue);
+        assert!(h.kills.is_empty());
+        assert_eq!(s.status(), "Kill cancelled");
+    }
+
+    #[test]
+    fn kill_failure_is_reported() {
+        let (mut s, mut h) = setup(10);
+        h.refuse = true;
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        press(&mut s, &mut h, KeyCode::Char('y'));
+        assert_eq!(s.status(), "1000: not permitted");
+        assert_eq!(selected_pid(&s), Some(1000));
+    }
+
+    #[test]
+    fn refresh_keeps_the_selected_process() {
+        let (mut s, mut h) = setup(10);
+        typed(&mut s, &mut h, "jjjjj");
+        h.pids.retain(|p| *p != 1001);
+        press(&mut s, &mut h, KeyCode::Char('r'));
+        assert_eq!(selected_pid(&s), Some(1005));
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn selection_clamps_when_the_list_shrinks() {
+        let (mut s, mut h) = setup(10);
+        press(&mut s, &mut h, KeyCode::Char('G'));
+        h.pids.truncate(3);
+        press(&mut s, &mut h, KeyCode::Char('r'));
+        assert_eq!(selected_pid(&s), Some(1002));
+    }
+
+    #[test]
+    fn kill_with_nothing_listed() {
+        let mut s = State::new(table_of(&[]));
+        let mut h = FakeHost::default();
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        assert_eq!(s.status(), "Nothing selected");
     }
 
     #[test]
     fn escape_cancels_prompt_then_quits() {
-        let mut s = State::new(&table(5));
-        typed(&mut s, "/x");
-        assert_eq!(press(&mut s, KeyCode::Esc), Flow::Continue);
+        let (mut s, mut h) = setup(5);
+        typed(&mut s, &mut h, "/x");
+        assert_eq!(press(&mut s, &mut h, KeyCode::Esc), Flow::Continue);
         assert!(s.prompt.is_none());
-        assert_eq!(press(&mut s, KeyCode::Char('q')), Flow::Quit);
+        assert_eq!(press(&mut s, &mut h, KeyCode::Char('q')), Flow::Quit);
     }
 
     #[test]
     fn short_output_shows_end() {
-        let mut s = State::new(&table(3));
-        s.resize(80, 10);
+        let (s, _) = setup(3);
         assert!(s.status().contains("(END)"));
+    }
+
+    #[test]
+    fn selected_row_is_drawn_as_a_bar() {
+        let (mut s, mut h) = setup(10);
+        typed(&mut s, &mut h, "jj");
+        let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        term.draw(|f| draw(f, &mut s, true)).unwrap();
+        let buf = term.backend().buffer();
+        // Row 0 is the header, so the third body row is y = 3.
+        for x in 0..30 {
+            assert!(buf[(x, 3)].modifier.contains(Modifier::REVERSED), "x={x}");
+        }
+        assert!(!buf[(0, 2)].modifier.contains(Modifier::REVERSED));
     }
 }

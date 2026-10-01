@@ -64,6 +64,8 @@ pub struct Options {
     pub patterns: Vec<String>,
     pub color: ColorMode,
     pub no_pager: bool,
+    /// `-i`: open the interactive view even when the output fits on screen.
+    pub interactive: bool,
     /// `Some(true)` = `--human`, `Some(false)` = `--raw`, `None` = decide by tty.
     pub human: Option<bool>,
 }
@@ -152,6 +154,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 "help" => o.action = Action::Help,
                 "version" => o.action = Action::Version,
                 "no-pager" => o.no_pager = true,
+                "interactive" => o.interactive = true,
                 "human" => o.human = Some(true),
                 "raw" => o.human = Some(false),
                 "color" | "colour" => {
@@ -267,6 +270,7 @@ fn parse_dash(
             'w' => o.wide = o.wide.saturating_add(1),
             'L' => o.action = Action::ListKeywords,
             'P' => o.no_pager = true,
+            'i' => o.interactive = true,
             'h' => o.action = Action::Help,
             'V' => o.action = Action::Version,
             'o' => {
@@ -368,13 +372,16 @@ Output:
 
 Display:
   --color[=WHEN]   auto (default), always, never; NO_COLOR also disables color
+  -i, --interactive  always open the interactive view, even for short output
   -P, --no-pager   never open the pager (or set PSS_PAGER=0)
   --human, --raw   sizes as 1.2G, or in KiB like ps (default: human on a terminal)
   -h, --help       this help
   -V, --version    version
 
-Pager keys: j/k ↑/↓ scroll, space/b page, g/G top/bottom, ←/→ pan,
-            / search, n/N next/previous match, q quit.
+Interactive view (opens when output is taller than the screen, or with -i):
+  j/k ↑/↓ select   space/b page   g/G top/bottom   ←/→ pan
+  K kill selected (y = TERM, 9 = KILL)   r refresh
+  / search   n/N next/previous match   q quit
 
 Fields shown as - need root on macOS (try `sudo pss aux`).
 ";
@@ -458,6 +465,13 @@ mod tests {
         assert!(p(&["-p"]).is_err());
         assert!(p(&["-p", "abc"]).is_err());
         assert!(p(&["--color=sometimes"]).is_err());
+    }
+
+    #[test]
+    fn interactive_flag() {
+        assert!(!p(&[]).unwrap().interactive);
+        assert!(p(&["-i", "node"]).unwrap().interactive);
+        assert!(p(&["aux", "--interactive"]).unwrap().interactive);
     }
 
     #[test]

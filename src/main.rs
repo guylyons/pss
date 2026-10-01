@@ -1,9 +1,11 @@
+mod app;
 mod cli;
 mod columns;
 mod format;
 mod output;
 mod process;
 mod select;
+mod signal;
 mod source;
 mod style;
 mod table;
@@ -13,10 +15,8 @@ mod users;
 use std::io::{self, BufWriter, IsTerminal};
 use std::process::ExitCode;
 
+use app::Collector;
 use cli::{Action, ColorMode, Options};
-use columns::Ctx;
-use select::Selectors;
-use text::Matcher;
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args().skip(1)) {
@@ -49,7 +49,6 @@ fn env_set(name: &str) -> bool {
 }
 
 fn run(o: &Options) -> io::Result<ExitCode> {
-    let sel = Selectors::resolve(o).map_err(io::Error::other)?;
     let tty = io::stdout().is_terminal();
     let color = match o.color {
         ColorMode::Always => true,
@@ -59,24 +58,19 @@ fn run(o: &Options) -> io::Result<ExitCode> {
         }
     };
 
-    let snap = source::system().snapshot()?;
-    let ctx = Ctx {
-        total_memory: snap.total_memory,
-        now: snap.now,
-        my_uid: snap.my_uid,
-        human: o.human.unwrap_or(tty),
-        comm_only: o.comm_only,
-        short_users: tty,
+    let mut app = Collector::new(o.clone(), tty).map_err(io::Error::other)?;
+    let table = app.collect()?;
+    // Like pgrep: searching for something that isn't there is a failure.
+    let code = if app.searched() && table.rows.is_empty() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     };
-    let matcher = Matcher::new(&o.patterns);
-    let mut procs = select::select(&snap, o, &sel, matcher.as_ref());
-    select::sort(&mut procs, &o.sort, &ctx);
-    let table = table::build(&procs, &o.columns(), &ctx, matcher.as_ref());
 
     let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
     let page = tty && !o.no_pager && std::env::var("PSS_PAGER").map_or(true, |v| v != "0");
-    if page && table.rows.len() + 1 >= rows as usize {
-        output::pager::run(&table, color)?;
+    if page && (o.interactive || table.rows.len() + 1 >= rows as usize) {
+        output::pager::run(table, color, &mut app)?;
     } else {
         let width = match (tty, o.wide) {
             (false, _) | (_, 2..) => None,
@@ -90,16 +84,5 @@ fn run(o: &Options) -> io::Result<ExitCode> {
             width,
         )?;
     }
-
-    // Like pgrep: searching for something that isn't there is a failure.
-    let searched = matcher.is_some()
-        || !o.pids.is_empty()
-        || !o.users.is_empty()
-        || !o.real_users.is_empty()
-        || !o.ttys.is_empty();
-    Ok(if searched && procs.is_empty() {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(code)
 }

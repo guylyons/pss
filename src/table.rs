@@ -7,11 +7,20 @@ use crate::process::Process;
 use crate::style::Role;
 use crate::text::{Line, Matcher, Span, highlight, plain_text};
 
+/// Which process a row shows, so the pager can act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowId {
+    pub pid: i32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     /// Empty when there is no header line.
     pub header: Line,
     pub rows: Vec<Line>,
+    /// Parallel to `rows`.
+    pub ids: Vec<RowId>,
 }
 
 pub fn build(procs: &[&Process], cols: &[Column], ctx: &Ctx, matcher: Option<&Matcher>) -> Table {
@@ -61,6 +70,13 @@ pub fn build(procs: &[&Process], cols: &[Column], ctx: &Ctx, matcher: Option<&Ma
         rows: cells
             .into_iter()
             .map(|row| join(row, cols, &widths))
+            .collect(),
+        ids: procs
+            .iter()
+            .map(|p| RowId {
+                pid: p.pid,
+                name: p.name().to_string(),
+            })
             .collect(),
     }
 }
@@ -154,6 +170,34 @@ mod tests {
         let t = build(&[&p], &cols, &ctx(), Some(&m));
         let matched: Vec<_> = t.rows[0].iter().filter(|s| s.role == Role::Match).collect();
         assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn rows_remember_their_process() {
+        let a = Process {
+            pid: 7,
+            comm: "sleep".into(),
+            ..Default::default()
+        };
+        let b = Process {
+            pid: 9,
+            comm: "vim".into(),
+            ..Default::default()
+        };
+        let t = build(&[&a, &b], &[Column::new(Kw::Pid)], &ctx(), None);
+        assert_eq!(
+            t.ids,
+            vec![
+                RowId {
+                    pid: 7,
+                    name: "sleep".into()
+                },
+                RowId {
+                    pid: 9,
+                    name: "vim".into()
+                }
+            ]
+        );
     }
 
     #[test]
