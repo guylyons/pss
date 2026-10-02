@@ -27,9 +27,9 @@ Run `pss --help` for everything.
 | `j`/`k`, `↑`/`↓` | select |
 | `space`/`b`, `g`/`G` | page, top/bottom |
 | `←`/`→` | pan |
-| `K` | kill the selected process (`y` = TERM, `9` = KILL) |
+| `K` | kill the selected process (`y` = TERM, `9` = KILL); the row turns red while it asks, then faded and struck through until the process exits and drops off the list |
 | `/`, `n`/`N` | search, next/previous match |
-| `r` | refresh |
+| `r` | refresh now (the list also refreshes itself every 2s) |
 | `q` | quit |
 
 ## Install

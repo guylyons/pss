@@ -35,6 +35,12 @@ pub enum Role {
     Match,
     /// Text matching the pager's `/` search.
     SearchHit,
+    /// Whole-row states in the interactive view, drawn over the row's text.
+    Selected,
+    /// Waiting for the user to confirm killing it.
+    Doomed,
+    /// Sent a signal; still there until the next refresh shows it gone.
+    Dying,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,7 @@ pub struct Style {
     pub bold: bool,
     pub dim: bool,
     pub underline: bool,
+    pub strike: bool,
 }
 
 impl Style {
@@ -67,6 +74,7 @@ impl Style {
             bold: false,
             dim: false,
             underline: false,
+            strike: false,
         }
     }
     const DIM: Style = Style {
@@ -75,6 +83,7 @@ impl Style {
         bold: false,
         dim: true,
         underline: false,
+        strike: false,
     };
     const BOLD: Style = Style {
         fg: None,
@@ -82,6 +91,7 @@ impl Style {
         bold: true,
         dim: false,
         underline: false,
+        strike: false,
     };
     const fn bold(mut self) -> Style {
         self.bold = true;
@@ -136,6 +146,21 @@ pub fn theme(role: Role) -> Style {
             fg: Some(Color::Black),
             bg: Some(Color::Cyan),
             bold: true,
+            ..Style::default()
+        },
+        Role::Selected => Style {
+            bg: Some(Color::Indexed(237)), // dark gray: keeps the cells' own colors readable
+            ..Style::default()
+        },
+        Role::Doomed => Style {
+            fg: Some(Color::Indexed(231)), // white
+            bg: Some(Color::Indexed(124)), // deep red
+            bold: true,
+            ..Style::default()
+        },
+        Role::Dying => Style {
+            fg: Some(Color::Indexed(174)), // faded red
+            strike: true,
             ..Style::default()
         },
     }

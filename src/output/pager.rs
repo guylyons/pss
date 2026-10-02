@@ -1,8 +1,10 @@
 //! The interactive view: a `less`-style pager with a selection bar.
 //! Pinned header, scrolling, panning, `/` search, and `K` to kill the
-//! selected process. [`State`] holds all the logic; [`run`] only draws it.
+//! selected process. The list refreshes itself while open. [`State`] holds
+//! all the logic; [`run`] only draws it.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -48,6 +50,8 @@ pub struct State {
     pub prompt: Option<String>,
     /// Some while asking whether to kill this process.
     confirm: Option<RowId>,
+    /// Sent a signal and still listed; dropped once a refresh shows them gone.
+    dying: Vec<RowId>,
     pub message: Option<String>,
 }
 
@@ -65,6 +69,7 @@ impl State {
             query: String::new(),
             prompt: None,
             confirm: None,
+            dying: Vec::new(),
             message: None,
         }
     }
@@ -119,6 +124,29 @@ impl State {
             .unwrap_or(self.cursor)
             .min(self.last());
         self.follow();
+        let ids = &self.table.ids;
+        let (alive, gone) = std::mem::take(&mut self.dying)
+            .into_iter()
+            .partition(|r| ids.contains(r));
+        self.dying = alive;
+        if let Some(RowId { pid, name }) = gone.last() {
+            self.message = Some(format!("{pid} ({name}) exited"));
+        }
+    }
+
+    /// Refresh on a timer, quicker while waiting for a killed process to exit.
+    pub fn interval(&self) -> Duration {
+        if self.dying.is_empty() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
+
+    pub fn tick(&mut self, host: &mut dyn Host) {
+        if let Err(e) = self.reload(host) {
+            self.message = Some(e);
+        }
     }
 
     fn reload(&mut self, host: &mut dyn Host) -> Result<(), String> {
@@ -179,7 +207,7 @@ impl State {
                 Some(row) => self.confirm = Some(row.clone()),
                 None => self.message = Some("Nothing selected".into()),
             },
-            KeyCode::Char('r') => self.message = self.reload(host).err(),
+            KeyCode::Char('r') => self.tick(host),
             _ => {}
         }
         Flow::Continue
@@ -194,17 +222,14 @@ impl State {
                 return;
             }
         };
+        if let Err(e) = host.kill(target.pid, sig) {
+            self.message = Some(e);
+            return;
+        }
         let RowId { pid, name } = &target;
-        self.message = Some(match host.kill(*pid, sig) {
-            Err(e) => e,
-            Ok(()) => {
-                let sent = format!("Sent {} to {pid} ({name})", sig.name());
-                match self.reload(host) {
-                    Ok(()) => sent,
-                    Err(e) => format!("{sent}; {e}"),
-                }
-            }
-        });
+        self.message = Some(format!("Sent {} to {pid} ({name}), waiting for it to exit", sig.name()));
+        self.dying.push(target);
+        self.tick(host);
     }
 
     /// Select the next (or previous) row matching the search. `inclusive`
@@ -279,8 +304,15 @@ fn event_loop(
     color: bool,
     host: &mut dyn Host,
 ) -> io::Result<()> {
+    let mut refreshed = Instant::now();
     loop {
         terminal.draw(|f| draw(f, &mut state, color))?;
+        // Count from the last refresh so steady typing can't hold it off.
+        if !event::poll(state.interval().saturating_sub(refreshed.elapsed()))? {
+            state.tick(host);
+            refreshed = Instant::now();
+            continue;
+        }
         match event::read()? {
             Event::Key(k)
                 if k.kind != KeyEventKind::Release && state.key(k, host) == Flow::Quit =>
@@ -323,16 +355,42 @@ fn draw(f: &mut Frame, state: &mut State, color: bool) {
         .collect();
     f.render_widget(Paragraph::new(rows).scroll((0, left)), body);
 
-    // The selection bar spans the full width, past the end of the text.
-    if !state.table.rows.is_empty() {
-        let y = body.y + (state.cursor - state.top) as u16;
-        f.buffer_mut().set_style(
-            Rect::new(body.x, y, body.width, 1),
-            TStyle::default().add_modifier(Modifier::REVERSED),
-        );
+    // Row states span the full width, past the end of the text.
+    let visible = state.table.ids.iter().enumerate().skip(state.top).take(state.height);
+    for (i, id) in visible {
+        let y = body.y + (i - state.top) as u16;
+        let row = Rect::new(body.x, y, body.width, 1);
+        if state.confirm.as_ref() == Some(id) {
+            f.buffer_mut().set_style(row, tui_style(Role::Doomed, color));
+            continue;
+        }
+        if state.dying.contains(id) {
+            f.buffer_mut().set_style(row, tui_style(Role::Dying, color));
+        }
+        if i == state.cursor {
+            f.buffer_mut().set_style(row, tui_style(Role::Selected, color));
+            if color {
+                // Default-colored text would be dark-on-dark on a light theme.
+                for x in row.left()..row.right() {
+                    let cell = &mut f.buffer_mut()[(x, y)];
+                    if cell.fg == TColor::Reset {
+                        cell.set_fg(TColor::Indexed(255));
+                    }
+                }
+            }
+        }
     }
 
-    let status_style = TStyle::default().add_modifier(Modifier::REVERSED);
+    let status_role = if state.confirm.is_some() {
+        Role::Doomed
+    } else {
+        Role::Selected
+    };
+    let status_style = if color {
+        tui_style(status_role, true).fg(TColor::Indexed(255))
+    } else {
+        TStyle::default().add_modifier(Modifier::REVERSED)
+    };
     f.render_widget(Paragraph::new(state.status()).style(status_style), foot);
 }
 
@@ -349,7 +407,11 @@ fn tui_style(role: Role, color: bool) -> TStyle {
         // Without color, still make headers and matches findable.
         return match role {
             Role::Header => TStyle::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            Role::Match | Role::SearchHit => TStyle::default().add_modifier(Modifier::REVERSED),
+            Role::Match | Role::SearchHit | Role::Selected => {
+                TStyle::default().add_modifier(Modifier::REVERSED)
+            }
+            Role::Doomed => TStyle::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            Role::Dying => TStyle::default().add_modifier(Modifier::CROSSED_OUT),
             _ => TStyle::default(),
         };
     }
@@ -365,6 +427,7 @@ fn tui_style(role: Role, color: bool) -> TStyle {
         (s.bold, Modifier::BOLD),
         (s.dim, Modifier::DIM),
         (s.underline, Modifier::UNDERLINED),
+        (s.strike, Modifier::CROSSED_OUT),
     ] {
         if on {
             t = t.add_modifier(m);
@@ -424,6 +487,8 @@ mod tests {
         pids: Vec<i32>,
         kills: Vec<(i32, Signal)>,
         refuse: bool,
+        /// Killed processes linger until the test removes them.
+        slow: bool,
     }
 
     impl Host for FakeHost {
@@ -435,7 +500,9 @@ mod tests {
                 return Err(format!("{pid}: not permitted"));
             }
             self.kills.push((pid, sig));
-            self.pids.retain(|p| *p != pid);
+            if !self.slow {
+                self.pids.retain(|p| *p != pid);
+            }
             Ok(())
         }
     }
@@ -518,9 +585,38 @@ mod tests {
 
         press(&mut s, &mut h, KeyCode::Char('y'));
         assert_eq!(h.kills, vec![(1003, Signal::Term)]);
-        assert_eq!(s.status(), "Sent TERM to 1003 (p3)");
+        assert_eq!(s.status(), "1003 (p3) exited");
         assert!(!s.table.ids.iter().any(|r| r.pid == 1003), "list refreshed");
         assert_eq!(selected_pid(&s), Some(1004), "selection stays in place");
+    }
+
+    #[test]
+    fn killed_process_is_marked_until_a_refresh_shows_it_gone() {
+        let (mut s, mut h) = setup(10);
+        h.slow = true;
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        assert_eq!(s.confirm.as_ref().map(|r| r.pid), Some(1000), "about to die");
+        press(&mut s, &mut h, KeyCode::Char('y'));
+        assert_eq!(s.status(), "Sent TERM to 1000 (p0), waiting for it to exit");
+        assert_eq!(s.dying.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1000]);
+        assert_eq!(s.interval(), Duration::from_millis(250), "polls faster");
+
+        s.tick(&mut h);
+        assert_eq!(s.dying.len(), 1, "still running");
+        h.pids.retain(|p| *p != 1000);
+        s.tick(&mut h);
+        assert!(s.dying.is_empty());
+        assert!(!s.table.ids.iter().any(|r| r.pid == 1000), "removed");
+        assert_eq!(s.status(), "1000 (p0) exited");
+        assert_eq!(s.interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tick_picks_up_new_processes() {
+        let (mut s, mut h) = setup(3);
+        h.pids.push(2000);
+        s.tick(&mut h);
+        assert!(s.table.ids.iter().any(|r| r.pid == 2000));
     }
 
     #[test]
@@ -601,8 +697,24 @@ mod tests {
         let buf = term.backend().buffer();
         // Row 0 is the header, so the third body row is y = 3.
         for x in 0..30 {
-            assert!(buf[(x, 3)].modifier.contains(Modifier::REVERSED), "x={x}");
+            assert_eq!(buf[(x, 3)].bg, TColor::Indexed(237), "x={x}");
         }
-        assert!(!buf[(0, 2)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(0, 2)].bg, TColor::Reset);
+    }
+
+    #[test]
+    fn kill_states_color_their_rows() {
+        let (mut s, mut h) = setup(10);
+        h.slow = true;
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        press(&mut s, &mut h, KeyCode::Char('y'));
+        press(&mut s, &mut h, KeyCode::Char('j'));
+        press(&mut s, &mut h, KeyCode::Char('K'));
+        let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        term.draw(|f| draw(f, &mut s, true)).unwrap();
+        let buf = term.backend().buffer();
+        assert!(buf[(29, 1)].modifier.contains(Modifier::CROSSED_OUT), "dying");
+        assert_eq!(buf[(29, 2)].bg, TColor::Indexed(124), "about to die");
+        assert_eq!(buf[(0, 7)].bg, TColor::Indexed(124), "status asks in red");
     }
 }
